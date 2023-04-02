@@ -4,6 +4,8 @@ import numpy as np
 
 from .cifar10 import load_cifar10
 
+DATASETS = ['cifar10']
+
 _LOAD_DATASET_FN = {
     'cifar10': load_cifar10
 }
