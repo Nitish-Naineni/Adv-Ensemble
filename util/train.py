@@ -1,9 +1,50 @@
 import torch
+import copy
+from contextlib import ExitStack
+import numpy as np
+import pandas as pd
+from tqdm import tqdm as tqdm
 
-from .utils import seed
+import copy
+import json
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .utils import seed, set_bn_momentum
 from models import create_model
 from attacks import create_attack
 from .trades import trades_loss
+from attacks import CWLoss
+from metrics import accuracy
+
+from .utils import ctx_noparamgrad_and_eval
+from .utils import set_bn_momentum
+from .utils import seed
+
+from .trades import trades_loss
+from .cutmix import cutmix
+
+from torch.cuda.amp import autocast, GradScaler
+
+
+class Ensemble(nn.Module):
+    def __init__(self, models):
+        super(Ensemble, self).__init__()
+        self.models = models
+        assert len(self.models) > 0
+
+    def forward(self, x):
+        if len(self.models) > 1:
+            outputs = 0
+            for model in self.models:
+                outputs += F.softmax(model(x), dim=-1)
+            output = outputs / len(self.models)
+            output = torch.clamp(output, min=1e-40)
+            return torch.log(output)
+        else:
+            return self.models[0](x)
+
 
 class Trainer(object):
     def __init__(self,args):
@@ -11,69 +52,60 @@ class Trainer(object):
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         seed(args.seed)
-        self.model = create_model(args.model, args.normalize, info)
-        self.wa_model = copy.deepcopy(self.model)
-        self.args = args
+        self.models = []
+        self.wa_models = []
+        for i in range(args.num_models):
+            model = create_model(args.model, args.normalize, info)
+            wa_model = copy.deepcopy(model)
+            self.models.append(model)
+            self.wa_models.append(wa_model)
+        self.params = args
         self.criterion = nn.CrossEntropyLoss()
-        self.init_optimizer(self.args.num_adv_epochs)
+        self.init_optimizer(self.params.num_adv_epochs)
 
-        if self.args.pretrained_file is not None:
-            self.load_model(os.path.join(self.args.log_dir, self.args.pretrained_file, 'weights-best.pt'))
+        if self.params.pretrained_file is not None:
+            self.load_model(os.path.join(self.params.log_dir, self.params.pretrained_file, 'weights-best.pt'))
 
         self.eval_attack = create_attack(
-            model=self.wa_model, 
+            model=Ensemble(self.wa_models), 
             criterion=CWLoss, 
-            attack_type=args.attack, 
-            attack_eps=args.attack_eps, 
-            attack_iter=4*args.attack_iter, 
-            attack_step=args.attack_step
+            attack_type=params.attack, 
+            attack_eps=params.attack_eps, 
+            attack_iter=4*params.attack_iter, 
+            attack_step=params.attack_step
         )
 
-        num_samples = 50000 if 'cifar' in self.args.data else 73257
-        num_samples = 100000 if 'tiny-imagenet' in self.args.data else num_samples
-        if self.args.data == 'cifar10':
+        num_samples = 50000 if 'cifar' in self.params.data else 73257
+        num_samples = 100000 if 'tiny-imagenet' in self.params.data else num_samples
+        if self.params.data == 'cifar10':
             self.num_classes = 10
-        elif self.args.data == 'cifar100':
+        elif self.params.data == 'cifar100':
             self.num_classes = 100
         else:
-            raise ValueError(f'Invalid model name {self.args.data}!')
-        self.update_steps = int(np.floor(num_samples/self.args.batch_size) + 1)
-        self.warmup_steps = 0.025 * self.args.num_adv_epochs * self.update_steps
+            raise ValueError(f'Invalid model name {self.params.data}!')
+        self.update_steps = int(np.floor(num_samples/self.params.batch_size) + 1)
+        self.warmup_steps = 0.025 * self.params.num_adv_epochs * self.update_steps
 
         self.scaler = GradScaler()
-
-    @staticmethod
-    def init_attack(model, criterion, attack_type, attack_eps, attack_iter, attack_step):
-        """
-        Initialize adversary.
-        """
-        attack = create_attack(model, criterion, attack_type, attack_eps, attack_iter, attack_step, rand_init_type='uniform')
-        if attack_type in ['linf-pgd', 'l2-pgd']:
-            eval_attack = create_attack(model, criterion, attack_type, attack_eps, 2*attack_iter, attack_step)
-        elif attack_type in ['fgsm', 'linf-df']:
-            eval_attack = create_attack(model, criterion, 'linf-pgd', 8/255, 20, 2/255)
-        elif attack_type in ['fgm', 'l2-df']:
-            eval_attack = create_attack(model, criterion, 'l2-pgd', 128/255, 20, 15/255)
-        return attack,  eval_attack
     
     
     def init_optimizer(self, num_epochs):
         """
         Initialize optimizer and schedulers.
         """
-        def group_weight(model):
+        def group_weight(models):
             group_decay = []
             group_no_decay = []
-            for n, p in model.named_parameters():
-                if 'batchnorm' in n:
-                    group_no_decay.append(p)
-                else:
-                    group_decay.append(p)
-            assert len(list(model.parameters())) == len(group_decay) + len(group_no_decay)
+            for model in models:
+                for n, p in model.named_parameters():
+                    if 'batchnorm' in n:
+                        group_no_decay.append(p)
+                    else:
+                        group_decay.append(p)
             groups = [dict(params=group_decay), dict(params=group_no_decay, weight_decay=.0)]
             return groups
         
-        self.optimizer = torch.optim.SGD(group_weight(self.model), lr=self.params.lr, weight_decay=self.params.weight_decay, 
+        self.optimizer = torch.optim.SGD(group_weight(self.models), lr=self.params.lr, weight_decay=self.params.weight_decay, 
                                          momentum=0.9, nesterov=self.params.nesterov)
         if num_epochs <= 0:
             return
@@ -106,16 +138,17 @@ class Trainer(object):
         Run one epoch of training.
         """
         metrics = pd.DataFrame()
-        self.model.train()
+        for model in self.models:
+            model.train()
         
         update_iter = 0
         for data in tqdm(dataloader, desc=f'Epoch {epoch}: ', disable=not verbose):
             global_step = (epoch - 1) * self.update_steps + update_iter
             if global_step == 0:
                 # make BN running mean and variance init same as Haiku
-                set_bn_momentum(self.model, momentum=1.0)
+                set_bn_momentum(self.models, momentum=1.0)
             elif global_step == 1:
-                set_bn_momentum(self.model, momentum=0.01)
+                set_bn_momentum(self.models, momentum=0.01)
             update_iter += 1
             
             x, y = data
@@ -153,12 +186,15 @@ class Trainer(object):
                     
             # loss.backward()
             # if self.params.clip_grad:
-            #     nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_grad)
+            #     for model in self.models:
+            #         nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
             # self.optimizer.step()
+
             self.scaler.scale(loss).backward()
             if self.params.clip_grad:
                 self.scaler.unscale_(self.optimizer)
-                nn.utils.clip_grad_norm_(self.model.parameters(), self.params.clip_grad)
+                for model in self.models:
+                    nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
             self.scaler.step(self.optimizer)
             self.scaler.update()
 
@@ -166,61 +202,22 @@ class Trainer(object):
                 self.scheduler.step()
             
             global_step = (epoch - 1) * self.update_steps + update_iter
-            ema_update(self.wa_model, self.model, global_step, decay_rate=self.params.tau, 
+            ema_update(self.wa_models, self.models, global_step, decay_rate=self.params.tau, 
                        warmup_steps=self.warmup_steps, dynamic_decay=True)
             metrics = metrics.append(pd.DataFrame(batch_metrics, index=[0]), ignore_index=True)
         
         if self.params.scheduler in ['step', 'converge', 'cosine', 'cosinew']:
             self.scheduler.step()
         
-        update_bn(self.wa_model, self.model) 
+        update_bn(self.wa_models, self.models) 
         return dict(metrics.mean())
-    
-    
-    def standard_loss(self, x, y):
-        """
-        Standard training.
-        """
-        self.optimizer.zero_grad()
-        out = self.model(x)
-        loss = self.criterion(out, y)
-        
-        preds = out.detach()
-        batch_metrics = {'loss': loss.item(), 'clean_acc': accuracy(y, preds)}
-        return loss, batch_metrics
-    
-    
-    def adversarial_loss(self, x, y):
-        """
-        Adversarial training (Madry et al, 2017).
-        """
-        with ctx_noparamgrad_and_eval(self.model):
-            x_adv, _ = self.attack.perturb(x, y)
-        
-        self.optimizer.zero_grad()
-        if self.params.keep_clean:
-            x_adv = torch.cat((x, x_adv), dim=0)
-            y_adv = torch.cat((y, y), dim=0)
-        else:
-            y_adv = y
-        out = self.model(x_adv)
-        loss = self.criterion(out, y_adv)
-        
-        preds = out.detach()
-        batch_metrics = {'loss': loss.item()}
-        if self.params.keep_clean:
-            preds_clean, preds_adv = preds[:len(x)], preds[len(x):]
-            batch_metrics.update({'clean_acc': accuracy(y, preds_clean), 'adversarial_acc': accuracy(y, preds_adv)})
-        else:
-            batch_metrics.update({'adversarial_acc': accuracy(y, preds)})    
-        return loss, batch_metrics
     
     
     def trades_loss(self, x, y, beta):
         """
         TRADES training.
         """
-        loss, batch_metrics = trades_loss(self.model, x, y, self.optimizer, step_size=self.params.attack_step, 
+        loss, batch_metrics = trades_loss(self.models, x, y, self.optimizer, step_size=self.params.attack_step, 
                                           epsilon=self.params.attack_eps, perturb_steps=self.params.attack_iter, 
                                           beta=beta, attack=self.params.attack, label_smoothing=self.params.ls,
                                           use_cutmix=self.params.CutMix)
@@ -232,17 +229,30 @@ class Trainer(object):
         Evaluate performance of the model.
         """
         acc = 0.0
-        self.wa_model.eval()
+        for wa_model in self.wa_models:
+            wa_model.eval()
         
         for x, y in dataloader:
             x, y = x.to(device), y.to(device)
+            out = 0
             if adversarial:
-                with ctx_noparamgrad_and_eval(self.wa_model):
-                    x_adv, _ = self.eval_attack.perturb(x, y)            
-                out = self.wa_model(x_adv)
+                with ExitStack() as es:
+                    for wa_model in self.wa_models:
+                        es.enter_context(ctx_noparamgrad_and_eval(wa_model))
+                    x_adv, _ = self.eval_attack.perturb(x, y)
+
+                for wa_model in self.wa_models:
+                    out += F.softmax(wa_model(x_adv), dim=-1)        
             else:
-                out = self.wa_model(x)
+                for wa_model in self.wa_models:
+                    out += F.softmax(wa_model(x), dim=-1)
+
+            out = out / len(self.wa_models)
+            out = torch.clamp(out, min=1e-40)
+            out = torch.log(out)
+
             acc += accuracy(y, out)
+
         acc /= len(dataloader)
         return acc
 
@@ -252,8 +262,8 @@ class Trainer(object):
         Save model weights.
         """
         torch.save({
-            'model_state_dict': self.wa_model.state_dict(), 
-            'unaveraged_model_state_dict': self.model.state_dict()
+            'model_state_dict': [wa_model.state_dict() for wa_model in self.wa_models], 
+            'unaveraged_model_state_dict': [model.state_dict() for model in self.models]
         }, path)
 
 
@@ -262,8 +272,8 @@ class Trainer(object):
         Save model weights and optimizer.
         """
         torch.save({
-            'model_state_dict': self.wa_model.state_dict(), 
-            'unaveraged_model_state_dict': self.model.state_dict(),
+            'model_state_dict': [wa_model.state_dict() for wa_model in self.wa_models],
+            'unaveraged_model_state_dict': [model.state_dict() for model in self.models],
             'optimizer_state_dict': self.optimizer.state_dict(), 
             'scheduler_state_dict': self.scheduler.state_dict(), 
             'epoch': epoch
@@ -277,7 +287,8 @@ class Trainer(object):
         checkpoint = torch.load(path)
         if 'model_state_dict' not in checkpoint:
             raise RuntimeError('Model weights not found at {}.'.format(path))
-        self.wa_model.load_state_dict(checkpoint['model_state_dict'])
+        for i, wa_model in enumerate(self.wa_models):
+            wa_model.load_state_dict(checkpoint['model_state_dict'][i])
 
     
     def load_model_resume(self, path):
@@ -287,14 +298,16 @@ class Trainer(object):
         checkpoint = torch.load(path)
         if 'model_state_dict' not in checkpoint:
             raise RuntimeError('Model weights not found at {}.'.format(path))
-        self.wa_model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.load_state_dict(checkpoint['unaveraged_model_state_dict'])
+        for i, wa_model in enumerate(self.wa_models):
+            wa_model.load_state_dict(checkpoint['model_state_dict'][i])
+        for i, model in enumerate(self.models):
+            model.load_state_dict(checkpoint['unaveraged_model_state_dict'][i])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         return checkpoint['epoch']
 
 
-def ema_update(wa_model, model, global_step, decay_rate=0.995, warmup_steps=0, dynamic_decay=True):
+def ema_update(wa_models, models, global_step, decay_rate=0.995, warmup_steps=0, dynamic_decay=True):
     """
     Exponential model weight averaging update.
     """
@@ -305,24 +318,25 @@ def ema_update(wa_model, model, global_step, decay_rate=0.995, warmup_steps=0, d
     else:
         decay = decay_rate
     decay *= factor
-    
-    for p_swa, p_model in zip(wa_model.parameters(), model.parameters()):
-        p_swa.data *= decay
-        p_swa.data += p_model.data * (1 - decay)
+    for model, wa_model in zip(self.models, self.wa_models):
+        for p_swa, p_model in zip(wa_model.parameters(), model.parameters()):
+            p_swa.data *= decay
+            p_swa.data += p_model.data * (1 - decay)
 
 
 @torch.no_grad()
-def update_bn(avg_model, model):
+def update_bn(avg_models, models):
     """
     Update batch normalization layers.
     """
-    avg_model.eval()
-    model.eval()
-    for module1, module2 in zip(avg_model.modules(), model.modules()):
-        if isinstance(module1, torch.nn.modules.batchnorm._BatchNorm):
-            module1.running_mean = module2.running_mean
-            module1.running_var = module2.running_var
-            module1.num_batches_tracked = module2.num_batches_tracked
+    for avg_model, model in zip(avg_models, models):
+        avg_model.eval()
+        model.eval()
+        for module1, module2 in zip(avg_model.modules(), model.modules()):
+            if isinstance(module1, torch.nn.modules.batchnorm._BatchNorm):
+                module1.running_mean = module2.running_mean
+                module1.running_var = module2.running_var
+                module1.num_batches_tracked = module2.num_batches_tracked
 
 
 
