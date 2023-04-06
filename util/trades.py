@@ -5,8 +5,25 @@ from torch.autograd import Variable
 import torch.optim as optim
 
 from core.metrics import accuracy
-from core.utils import SmoothCrossEntropyLoss
-from core.utils import track_bn_stats
+from util import SmoothCrossEntropyLoss
+from util import track_bn_stats
+
+class Ensemble(nn.Module):
+    def __init__(self, models):
+        super(Ensemble, self).__init__()
+        self.models = models
+        assert len(self.models) > 0
+
+    def forward(self, x):
+        if len(self.models) > 1:
+            outputs = 0
+            for model in self.models:
+                outputs += F.softmax(model(x), dim=-1)
+            output = outputs / len(self.models)
+            output = torch.clamp(output, min=1e-40)
+            return torch.log(output)
+        else:
+            return self.models[0](x)
 
 
 def squared_l2_norm(x):
@@ -33,7 +50,7 @@ def _jensen_shannon_div(logit1, logit2, T=1.):
     return jsd * 0.5
 
 
-def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, perturb_steps=10, beta=1.0, 
+def trades_loss(models, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, perturb_steps=10, beta=1.0, 
                 attack='linf-pgd', label_smoothing=0.1, use_cutmix=False, use_consistency=False, cons_lambda=0.0, cons_tem=0.0):
     """
     TRADES training (Zhang et al, 2019).
@@ -41,24 +58,27 @@ def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, 
   
     criterion_ce = SmoothCrossEntropyLoss(reduction='mean', smoothing=label_smoothing)
     criterion_kl = nn.KLDivLoss(reduction='batchmean')
-    model.train()
-    track_bn_stats(model, False)
+    for model in models:
+        model.train()
+        track_bn_stats(model, False)
     batch_size = len(x_natural)
     
     x_adv = x_natural.detach() +  torch.FloatTensor(x_natural.shape).uniform_(-epsilon, epsilon).cuda().detach()
     x_adv = torch.clamp(x_adv, 0.0, 1.0)
 
+    ensemble = Ensemble(models)
+
     if use_cutmix: # CutMix
         p_natural = y
     else:
-        p_natural = F.softmax(model(x_natural), dim=1)
+        p_natural = F.softmax(ensemble(x_natural), dim=1)
         p_natural = p_natural.detach()
     
     if attack == 'linf-pgd':
         for _ in range(perturb_steps):
             x_adv.requires_grad_()
             with torch.enable_grad():
-                loss_kl = criterion_kl(F.log_softmax(model(x_adv), dim=1), p_natural)
+                loss_kl = criterion_kl(F.log_softmax(ensemble(x_adv), dim=1), p_natural)
             grad = torch.autograd.grad(loss_kl, [x_adv])[0]
             x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
             x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
@@ -77,7 +97,7 @@ def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, 
             # optimize
             optimizer_delta.zero_grad()
             with torch.enable_grad():
-                loss = (-1) * criterion_kl(F.log_softmax(model(adv), dim=1), p_natural)
+                loss = (-1) * criterion_kl(F.log_softmax(ensemble(adv), dim=1), p_natural)
             loss.backward()
             # renorming gradient
             grad_norms = delta.grad.view(batch_size, -1).norm(p=2, dim=1)
@@ -94,15 +114,16 @@ def trades_loss(model, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, 
         x_adv = Variable(x_natural + delta, requires_grad=False)
     else:
         raise ValueError(f'Attack={attack} not supported for TRADES training!')
-    model.train()
-    track_bn_stats(model, True)
+    for model in models:
+        model.train()
+        track_bn_stats(model, True)
   
     x_adv = Variable(torch.clamp(x_adv, 0.0, 1.0), requires_grad=False)
     
     optimizer.zero_grad()
     # calculate robust loss
-    logits_natural = model(x_natural)
-    logits_adv = model(x_adv)
+    logits_natural = ensemble(x_natural)
+    logits_adv = ensemble(x_adv)
 
     if use_cutmix: # CutMix
         loss_natural = criterion_kl(F.log_softmax(logits_natural, dim=1), y)
