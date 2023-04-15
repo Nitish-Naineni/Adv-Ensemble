@@ -50,8 +50,8 @@ def _jensen_shannon_div(logit1, logit2, T=1.):
     return jsd * 0.5
 
 
-def trades_loss(models, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, perturb_steps=10, beta=1.0, 
-                attack='linf-pgd', label_smoothing=0.1, use_cutmix=False, use_consistency=False, cons_lambda=0.0, cons_tem=0.0):
+def trades_loss(models, x_natural, y, optimizer, step_size=0.003, epsilon=0.031, perturb_steps=10, 
+                beta=1.0, alpha=1.0, gamma=1.0, label_smoothing=0.1):
     """
     TRADES training (Zhang et al, 2019).
     """
@@ -68,52 +68,21 @@ def trades_loss(models, x_natural, y, optimizer, step_size=0.003, epsilon=0.031,
 
     ensemble = Ensemble(models)
 
-    if use_cutmix: # CutMix
-        p_natural = y
-    else:
-        p_natural = F.softmax(ensemble(x_natural), dim=1)
-        p_natural = p_natural.detach()
+    p_natural = F.softmax(ensemble(x_natural), dim=1)
+    p_natural = p_natural.detach()
     
-    if attack == 'linf-pgd':
-        for _ in range(perturb_steps):
-            x_adv.requires_grad_()
-            with torch.enable_grad():
-                loss_kl = criterion_kl(F.log_softmax(ensemble(x_adv), dim=1), p_natural)
-            grad = torch.autograd.grad(loss_kl, [x_adv])[0]
-            x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
-            x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
-            x_adv = torch.clamp(x_adv, 0.0, 1.0)
-    
-    elif attack == 'l2-pgd':
-        delta = 0.001 * torch.randn(x_natural.shape).cuda().detach()
-        delta = Variable(delta.data, requires_grad=True)
+    # if attack == 'linf-pgd':
+    for _ in range(perturb_steps):
+        x_adv.requires_grad_()
+        with torch.enable_grad():
+            loss_kl = criterion_kl(F.log_softmax(ensemble(x_adv), dim=1), p_natural)
+        grad = torch.autograd.grad(loss_kl, [x_adv])[0]
+        x_adv = x_adv.detach() + step_size * torch.sign(grad.detach())
+        x_adv = torch.min(torch.max(x_adv, x_natural - epsilon), x_natural + epsilon)
+        x_adv = torch.clamp(x_adv, 0.0, 1.0)
+    # else:
+    #     raise ValueError(f'Attack={attack} not supported for TRADES training!')
 
-        # Setup optimizers
-        optimizer_delta = optim.SGD([delta], lr=epsilon / perturb_steps * 2)
-
-        for _ in range(perturb_steps):
-            adv = x_natural + delta
-
-            # optimize
-            optimizer_delta.zero_grad()
-            with torch.enable_grad():
-                loss = (-1) * criterion_kl(F.log_softmax(ensemble(adv), dim=1), p_natural)
-            loss.backward()
-            # renorming gradient
-            grad_norms = delta.grad.view(batch_size, -1).norm(p=2, dim=1)
-            delta.grad.div_(grad_norms.view(-1, 1, 1, 1))
-            # avoid nan or inf if gradient is 0
-            if (grad_norms == 0).any():
-                delta.grad[grad_norms == 0] = torch.randn_like(delta.grad[grad_norms == 0])
-            optimizer_delta.step()
-
-            # projection
-            delta.data.add_(x_natural)
-            delta.data.clamp_(0, 1).sub_(x_natural)
-            delta.data.renorm_(p=2, dim=0, maxnorm=epsilon)
-        x_adv = Variable(x_natural + delta, requires_grad=False)
-    else:
-        raise ValueError(f'Attack={attack} not supported for TRADES training!')
     for model in models:
         model.train()
         track_bn_stats(model, True)
@@ -122,26 +91,37 @@ def trades_loss(models, x_natural, y, optimizer, step_size=0.003, epsilon=0.031,
     
     optimizer.zero_grad()
     # calculate robust loss
-    logits_natural = ensemble(x_natural)
-    logits_adv = ensemble(x_adv)
 
-    if use_cutmix: # CutMix
-        loss_natural = criterion_kl(F.log_softmax(logits_natural, dim=1), y)
-    else:
-        loss_natural = criterion_ce(logits_natural, y)
+    y_true = torch.zeros(x_natural.size(0), num_classes).cuda()
+    y_true.scatter_(1, y.view(-1, 1), 1)
 
-    loss_robust = criterion_kl(F.log_softmax(logits_adv, dim=1), F.softmax(logits_natural, dim=1))
-    loss = loss_natural + beta * loss_robust
+    loss_std = 0
+    mask_non_y_pred = []
+    ensemble_probs = 0
 
-    if use_consistency:
-        logits_adv1, logits_adv2 = logits_adv.chunk(2)
-        loss = loss + cons_lambda * _jensen_shannon_div(logits_adv1, logits_adv2, cons_tem)
+    for model in models:
+        outputs = model(x_natural)
+        loss_std += criterion_ce(outputs, y)
+        y_pred = F.softmax(outputs, dim=-1)
+        bool_R_y_true = torch.eq(torch.ones_like(y_true) - y_true,torch.ones_like(y_true))  
+        mask_non_y_pred.append(torch.masked_select(y_pred, bool_R_y_true).reshape(-1, num_classes - 1))
+        ensemble_probs += y_pred
     
-    if use_cutmix: # CutMix
-        batch_metrics = {'loss': loss.item(), 'clean_acc': -1, 
-                     'adversarial_acc': -1}
-    else:
-        batch_metrics = {'loss': loss.item(), 'clean_acc': accuracy(y, logits_natural.detach()), 
-                     'adversarial_acc': accuracy(y, logits_adv.detach())}
+    ensemble_probs = ensemble_probs / len(models)
+    ensemble_entropy = torch.sum(-torch.mul(ensemble_probs, torch.log(ensemble_probs + 1e-20)),dim=-1).mean()
+
+    mask_non_y_pred = torch.stack(mask_non_y_pred, dim=1)
+    
+    mask_non_y_pred = mask_non_y_pred / torch.norm(mask_non_y_pred, p=2, dim=-1,keepdim=True)
+    matrix = torch.matmul(mask_non_y_pred, mask_non_y_pred.permute(0, 2, 1))
+    log_det = torch.logdet(matrix + 1e-6 * torch.eye(len(models), device=matrix.device).unsqueeze(0)).mean()
+
+    logits_adv = ensemble(x_adv)
+    loss_robust = criterion_kl(F.log_softmax(logits_adv, dim=1), F.softmax(ensemble_probs, dim=1))
+
+    loss = loss_std + beta * loss_robust - alpha * ensemble_entropy - gamma * log_det
+
+    batch_metrics = {'loss': loss.item(), 'clean_acc': accuracy(y, ensemble_probs.detach()), 
+                    'adversarial_acc': accuracy(y, logits_adv.detach())}
         
     return loss, batch_metrics
