@@ -10,6 +10,23 @@ _LOAD_DATASET_FN = {
     'cifar10': load_cifar10
 }
 
+def get_data_info(data_dir):
+    """
+    Returns dataset information.
+    Arguments:
+        data_dir (str): path to data directory.
+    """
+    dataset = os.path.basename(os.path.normpath(data_dir))
+    if 'cifar100' in data_dir:
+        from .cifar100 import DATA_DESC
+    elif 'cifar10' in data_dir:
+        from .cifar10 import DATA_DESC
+    else:
+        raise ValueError(f'Only data in {DATASETS} are supported!')
+    DATA_DESC['data'] = dataset
+    return DATA_DESC
+
+
 class SemiSupervisedSampler(torch.utils.data.Sampler):
     """
     Reference : https://github.com/wzekai99/DM-Improves-AT/blob/main/core/data/semisup.py
@@ -54,7 +71,7 @@ class SemiSupervisedSampler(torch.utils.data.Sampler):
     def __len__(self):
         return self.num_batches
 
-def load_data(data_dir="./data/database/",dataset="cifar10", batch_size=256, batch_size_test=256, num_workers=4, augmentation='base', 
+def load_data(data_dir, dataset="cifar10", batch_size=256, batch_size_test=256, num_workers=4, augmentation='base', 
                 shuffle=True, unsup_fraction=None):
     """
     Returns dataloaders.
@@ -64,7 +81,6 @@ def load_data(data_dir="./data/database/",dataset="cifar10", batch_size=256, bat
         batch_size_test (int): batch size for validation.
         num_workers (int): number of workers for loading the data.
         augmentation (base/none): whether to use augmentations for training set.
-        shuffle_train (bool): whether to shuffle training set.
         aux_data_filename (str): path to unlabelled data.
         unsup_fraction (float): fraction of unlabelled data per batch.
     """

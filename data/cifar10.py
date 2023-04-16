@@ -6,6 +6,14 @@ import lmdb
 from PIL import Image
 from .transformations import get_transfom
 
+DATA_DESC = {
+    'data': 'cifar10',
+    'classes': ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck'),
+    'num_classes': 10,
+    'mean': [0.4914, 0.4822, 0.4465], 
+    'std': [0.2023, 0.1994, 0.2010],
+}
+
 class LMDBDataset(torch.utils.data.Dataset):
     """
     A dataset with auxiliary pseudo-labeled data stored in a LMDB
