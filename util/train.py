@@ -16,16 +16,20 @@ from models import create_model
 from attacks import create_attack
 from .trades import trades_loss
 from attacks import CWLoss
-from metrics import accuracy
+from .metrics import accuracy
 
-from .utils import ctx_noparamgrad_and_eval
+from .context import ctx_noparamgrad_and_eval
 from .utils import set_bn_momentum
 from .utils import seed
 
 from .trades import trades_loss
 from .cutmix import cutmix
 
-from torch.cuda.amp import autocast, GradScaler
+# from torch.cuda.amp import autocast, GradScaler
+
+SCHEDULERS = ['cyclic', 'step', 'cosine', 'cosinew']
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 class Ensemble(nn.Module):
@@ -47,7 +51,7 @@ class Ensemble(nn.Module):
 
 
 class Trainer(object):
-    def __init__(self,args):
+    def __init__(self,info,args):
         super(Trainer,self).__init__()
         
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -69,12 +73,12 @@ class Trainer(object):
         self.eval_attack = create_attack(
             model=Ensemble(self.wa_models), 
             criterion=CWLoss, 
-            attack_type=params.attack, 
-            attack_eps=params.attack_eps, 
-            attack_iter=4*params.attack_iter, 
-            attack_step=params.attack_step
+            attack_type=self.params.attack, 
+            attack_eps=self.params.attack_eps, 
+            attack_iter=4*self.params.attack_iter, 
+            attack_step=self.params.attack_step
         )
-
+        self.num_classes = info["num_classes"]
         num_samples = 50000 if 'cifar' in self.params.data else 73257
         num_samples = 100000 if 'tiny-imagenet' in self.params.data else num_samples
         if self.params.data == 'cifar10':
@@ -86,7 +90,7 @@ class Trainer(object):
         self.update_steps = int(np.floor(num_samples/self.params.batch_size) + 1)
         self.warmup_steps = 0.025 * self.params.num_adv_epochs * self.update_steps
 
-        self.scaler = GradScaler()
+        # self.scaler = GradScaler()
     
     
     def init_optimizer(self, num_epochs):
@@ -144,59 +148,66 @@ class Trainer(object):
         update_iter = 0
         for data in tqdm(dataloader, desc=f'Epoch {epoch}: ', disable=not verbose):
             global_step = (epoch - 1) * self.update_steps + update_iter
-            if global_step == 0:
-                # make BN running mean and variance init same as Haiku
-                set_bn_momentum(self.models, momentum=1.0)
-            elif global_step == 1:
-                set_bn_momentum(self.models, momentum=0.01)
+            for model in self.models:
+                if global_step == 0:
+                    # make BN running mean and variance init same as Haiku
+                    set_bn_momentum(model, momentum=1.0)
+                elif global_step == 1:
+                    set_bn_momentum(model, momentum=0.01)
             update_iter += 1
             
             x, y = data
             x = x.to(memory_format=torch.channels_last)
 
-            with autocast():
-                if self.params.consistency:
-                    x_aug1, x_aug2, y = x[0].to(device), x[1].to(device), y.to(device)
-                    if self.params.beta is not None:
-                        loss, batch_metrics = self.trades_loss_consistency(x_aug1, x_aug2, y, beta=self.params.beta)
+            # with autocast():
+            if self.params.consistency:
+                x_aug1, x_aug2, y = x[0].to(device), x[1].to(device), y.to(device)
+                if self.params.beta is not None:
+                    loss, batch_metrics = self.trades_loss_consistency(x_aug1, x_aug2, y, beta=self.params.beta)
 
+            else:
+                if self.params.CutMix:
+                    x_all, y_all = torch.empty(0), torch.empty(0)
+                    for i in range(4): # 128 x 4 = 512 or 256 x 4 = 1024
+                        x_tmp, y_tmp = x.detach(), y.detach()
+                        x_tmp, y_tmp = cutmix(x_tmp, y_tmp, alpha=1.0, beta=1.0, num_classes=self.num_classes)
+                        x_all = torch.cat((x_all, x_tmp), dim=0)
+                        y_all = torch.cat((y_all, y_tmp), dim=0)
+                    x, y = x_all.to(device), y_all.to(device)
                 else:
-                    if self.params.CutMix:
-                        x_all, y_all = torch.empty(0), torch.empty(0)
-                        for i in range(4): # 128 x 4 = 512 or 256 x 4 = 1024
-                            x_tmp, y_tmp = x.detach(), y.detach()
-                            x_tmp, y_tmp = cutmix(x_tmp, y_tmp, alpha=1.0, beta=1.0, num_classes=self.num_classes)
-                            x_all = torch.cat((x_all, x_tmp), dim=0)
-                            y_all = torch.cat((y_all, y_tmp), dim=0)
-                        x, y = x_all.to(device), y_all.to(device)
+                    x, y = x.to(device), y.to(device)
+                
+                if adversarial:
+                    if self.params.beta is not None and self.params.mart:
+                        loss, batch_metrics = self.mart_loss(x, y, beta=self.params.beta)
+                    elif self.params.beta is not None and self.params.LSE:
+                        loss, batch_metrics = self.trades_loss_LSE(x, y, beta=self.params.beta)
+                    elif self.params.beta is not None:
+                        loss, batch_metrics = self.trades_loss(
+                            x, 
+                            y, 
+                            beta=self.params.beta,
+                            lamda=self.params.lamda,
+                            log_det_lamda=self.params.log_det_lamda
+                        )
                     else:
-                        x, y = x.to(device), y.to(device)
+                        loss, batch_metrics = self.adversarial_loss(x, y)
+                else:
+                    loss, batch_metrics = self.standard_loss(x, y)
                     
-                    if adversarial:
-                        if self.params.beta is not None and self.params.mart:
-                            loss, batch_metrics = self.mart_loss(x, y, beta=self.params.beta)
-                        elif self.params.beta is not None and self.params.LSE:
-                            loss, batch_metrics = self.trades_loss_LSE(x, y, beta=self.params.beta)
-                        elif self.params.beta is not None:
-                            loss, batch_metrics = self.trades_loss(x, y, beta=self.params.beta)
-                        else:
-                            loss, batch_metrics = self.adversarial_loss(x, y)
-                    else:
-                        loss, batch_metrics = self.standard_loss(x, y)
-                    
-            # loss.backward()
-            # if self.params.clip_grad:
-            #     for model in self.models:
-            #         nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
-            # self.optimizer.step()
-
-            self.scaler.scale(loss).backward()
+            loss.backward()
             if self.params.clip_grad:
-                self.scaler.unscale_(self.optimizer)
                 for model in self.models:
                     nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
-            self.scaler.step(self.optimizer)
-            self.scaler.update()
+            self.optimizer.step()
+
+            # self.scaler.scale(loss).backward()
+            # if self.params.clip_grad:
+            #     self.scaler.unscale_(self.optimizer)
+            #     for model in self.models:
+            #         nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
+            # self.scaler.step(self.optimizer)
+            # self.scaler.update()
 
             if self.params.scheduler in ['cyclic']:
                 self.scheduler.step()
@@ -213,14 +224,14 @@ class Trainer(object):
         return dict(metrics.mean())
     
     
-    def trades_loss(self, x, y, beta):
+    def trades_loss(self, x, y, beta, lamda, log_det_lamda):
         """
         TRADES training.
         """
         loss, batch_metrics = trades_loss(self.models, x, y, self.optimizer, step_size=self.params.attack_step, 
                                           epsilon=self.params.attack_eps, perturb_steps=self.params.attack_iter, 
                                           beta=beta, attack=self.params.attack, label_smoothing=self.params.ls,
-                                          use_cutmix=self.params.CutMix)
+                                          lamda=lamda,log_det_lamda=log_det_lamda,num_classes=self.num_classes)
         return loss, batch_metrics
     
     
@@ -318,7 +329,7 @@ def ema_update(wa_models, models, global_step, decay_rate=0.995, warmup_steps=0,
     else:
         decay = decay_rate
     decay *= factor
-    for model, wa_model in zip(self.models, self.wa_models):
+    for model, wa_model in zip(models, wa_models):
         for p_swa, p_model in zip(wa_model.parameters(), model.parameters()):
             p_swa.data *= decay
             p_swa.data += p_model.data * (1 - decay)
