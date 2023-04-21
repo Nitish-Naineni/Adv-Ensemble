@@ -152,6 +152,8 @@ def resnet(name, num_classes=10, pretrained=False, device='cpu'):
     Returns:
         torch.nn.Module.
     """
+    if name == 'resnet4':
+        return ResNet(BasicBlock, [1, 1, 1, 1], num_classes=num_classes, device=device)
     if name == 'resnet18':
         return ResNet(BasicBlock, [2, 2, 2, 2], num_classes=num_classes, device=device)
     elif name == 'resnet34':

@@ -9,7 +9,7 @@ from .preact_resnetwithswish import preact_resnetwithswish
 from data import DATASETS
 
 
-MODELS = ['resnet18', 'resnet34', 'resnet50', 'resnet101', 
+MODELS = ['resnet4', 'resnet18', 'resnet34', 'resnet50', 'resnet101', 
           'preact-resnet18', 'preact-resnet34', 'preact-resnet50', 'preact-resnet101', 
           'preact-resnet18-swish', 'preact-resnet34-swish']
 
