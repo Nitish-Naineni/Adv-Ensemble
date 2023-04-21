@@ -14,7 +14,6 @@ import torch.nn.functional as F
 from .utils import seed, set_bn_momentum
 from models import create_model
 from attacks import create_attack
-from .trades import trades_loss
 from attacks import CWLoss
 from .metrics import accuracy
 
@@ -22,10 +21,7 @@ from .context import ctx_noparamgrad_and_eval
 from .utils import set_bn_momentum
 from .utils import seed
 
-from .trades import trades_loss
-from .cutmix import cutmix
-
-# from torch.cuda.amp import autocast, GradScaler
+from .trades import trades_loss, adp_loss
 
 SCHEDULERS = ['cyclic', 'step', 'cosine', 'cosinew']
 
@@ -90,7 +86,7 @@ class Trainer(object):
         self.update_steps = int(np.floor(num_samples/self.params.batch_size) + 1)
         self.warmup_steps = 0.025 * self.params.num_adv_epochs * self.update_steps
 
-        # self.scaler = GradScaler()
+        self.scaler = torch.cuda.amp.GradScaler()
     
     
     def init_optimizer(self, num_epochs):
@@ -122,7 +118,6 @@ class Trainer(object):
         """
         if self.params.scheduler == 'cyclic':
             num_samples = 50000 if 'cifar10' in self.params.data else 73257
-            num_samples = 100000 if 'tiny-imagenet' in self.params.data else num_samples
             update_steps = int(np.floor(num_samples/self.params.batch_size) + 1)
             self.scheduler = torch.optim.lr_scheduler.OneCycleLR(self.optimizer, max_lr=self.params.lr, pct_start=0.25,
                                                                  steps_per_epoch=update_steps, epochs=int(num_epochs))
@@ -137,7 +132,7 @@ class Trainer(object):
             self.scheduler = None
     
     
-    def train(self, dataloader, epoch=0, adversarial=False, verbose=False):
+    def train(self, dataloader, epoch=0, verbose=False):
         """
         Run one epoch of training.
         """
@@ -157,57 +152,24 @@ class Trainer(object):
             update_iter += 1
             
             x, y = data
-            x = x.to(memory_format=torch.channels_last)
+            x, y = x.to(device=device,memory_format=torch.channels_last), y.to(device=device)
+        
+            assert self.params.beta > 0
+            loss, batch_metrics = self.trades_loss(
+                x, 
+                y, 
+                beta=self.params.beta,
+                lamda=self.params.lamda,
+                log_det_lamda=self.params.log_det_lamda
+            )
 
-            # with autocast():
-            if self.params.consistency:
-                x_aug1, x_aug2, y = x[0].to(device), x[1].to(device), y.to(device)
-                if self.params.beta is not None:
-                    loss, batch_metrics = self.trades_loss_consistency(x_aug1, x_aug2, y, beta=self.params.beta)
-
-            else:
-                if self.params.CutMix:
-                    x_all, y_all = torch.empty(0), torch.empty(0)
-                    for i in range(4): # 128 x 4 = 512 or 256 x 4 = 1024
-                        x_tmp, y_tmp = x.detach(), y.detach()
-                        x_tmp, y_tmp = cutmix(x_tmp, y_tmp, alpha=1.0, beta=1.0, num_classes=self.num_classes)
-                        x_all = torch.cat((x_all, x_tmp), dim=0)
-                        y_all = torch.cat((y_all, y_tmp), dim=0)
-                    x, y = x_all.to(device), y_all.to(device)
-                else:
-                    x, y = x.to(device), y.to(device)
-                
-                if adversarial:
-                    if self.params.beta is not None and self.params.mart:
-                        loss, batch_metrics = self.mart_loss(x, y, beta=self.params.beta)
-                    elif self.params.beta is not None and self.params.LSE:
-                        loss, batch_metrics = self.trades_loss_LSE(x, y, beta=self.params.beta)
-                    elif self.params.beta is not None:
-                        loss, batch_metrics = self.trades_loss(
-                            x, 
-                            y, 
-                            beta=self.params.beta,
-                            lamda=self.params.lamda,
-                            log_det_lamda=self.params.log_det_lamda
-                        )
-                    else:
-                        loss, batch_metrics = self.adversarial_loss(x, y)
-                else:
-                    loss, batch_metrics = self.standard_loss(x, y)
-                    
-            loss.backward()
+            self.scaler.scale(loss).backward()
             if self.params.clip_grad:
+                self.scaler.unscale_(self.optimizer)
                 for model in self.models:
                     nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
-            self.optimizer.step()
-
-            # self.scaler.scale(loss).backward()
-            # if self.params.clip_grad:
-            #     self.scaler.unscale_(self.optimizer)
-            #     for model in self.models:
-            #         nn.utils.clip_grad_norm_(model.parameters(), self.params.clip_grad)
-            # self.scaler.step(self.optimizer)
-            # self.scaler.update()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             if self.params.scheduler in ['cyclic']:
                 self.scheduler.step()
@@ -252,11 +214,13 @@ class Trainer(object):
                         es.enter_context(ctx_noparamgrad_and_eval(wa_model))
                     x_adv, _ = self.eval_attack.perturb(x, y)
 
-                for wa_model in self.wa_models:
-                    out += F.softmax(wa_model(x_adv), dim=-1)        
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    for wa_model in self.wa_models:
+                        out += F.softmax(wa_model(x_adv), dim=-1)        
             else:
-                for wa_model in self.wa_models:
-                    out += F.softmax(wa_model(x), dim=-1)
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    for wa_model in self.wa_models:
+                        out += F.softmax(wa_model(x), dim=-1)
 
             out = out / len(self.wa_models)
             out = torch.clamp(out, min=1e-40)
@@ -348,8 +312,4 @@ def update_bn(avg_models, models):
                 module1.running_mean = module2.running_mean
                 module1.running_var = module2.running_var
                 module1.num_batches_tracked = module2.num_batches_tracked
-
-
-
-
         
