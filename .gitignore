@@ -2,3 +2,5 @@
 /data/database
 **/__pycache__
 /trained_models
+/train2.ipynb
+/tacker.csv
